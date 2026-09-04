@@ -9,7 +9,7 @@ Rake::TestTask.new(:test) do |t|
   t.test_files = FileList["test/**/*_test.rb"]
 end
 
-Rake::ExtensionTask.new("ractor/shared_var")
+Rake::ExtensionTask.new("ractor/lockfree_var")
 Rake::ExtensionTask.new("ractor/lockfree_hash")
 
 task test: :compile

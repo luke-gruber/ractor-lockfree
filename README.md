@@ -2,7 +2,7 @@
 
 State that Ractors share **without a lock**: a variable, and a hash table.
 
-## Ractor::SharedVar
+## Ractor::LockFree::Var
 
 One typed, shareable value. Any Ractor may read it or replace it, and no
 operation on it can ever block another one: each is a single atomic instruction
@@ -11,7 +11,7 @@ on a single machine word.
 ```ruby
 require "ractor/lockfree"
 
-var = Ractor::SharedVar.new(String, "hi".freeze)
+var = Ractor::LockFree::Var.new(String, "hi".freeze)
 var.set("hello".freeze)
 
 r = Ractor.new(var) do |v|
@@ -32,12 +32,12 @@ var.get            #=> "goodbye"
   finished before any reader can see the pointer to it, so a freshly frozen
   object is never seen half-built. Writes are release stores and reads are
   acquire loads — [and that is all this library asks
-  for](docs/shared_var.md#why-releaseacquire-and-not-sequential-consistency).
+  for](docs/var.md#why-releaseacquire-and-not-sequential-consistency).
 * A read-modify-write is a `compare_and_swap` loop, and the loop is **yours**, so
   you decide what a lost race costs:
 
 ```ruby
-tally = Ractor::SharedVar.new(Integer, 0)
+tally = Ractor::LockFree::Var.new(Integer, 0)
 4.times.map do
   Ractor.new(tally) do |v|
     500.times { loop { old = v.get; break if v.compare_and_swap(old, old + 1) } }
@@ -51,14 +51,14 @@ tally.get          #=> 2000
   conditional on the exact object the block was shown:
 
 ```ruby
-config = Ractor::SharedVar.new(Hash, { gen: 1, host: "a".freeze }.freeze)
+config = Ractor::LockFree::Var.new(Hash, { gen: 1, host: "a".freeze }.freeze)
 nxt = { gen: 2, host: "b".freeze }.freeze
 
 config.compare_and_swap({ gen: 1 }, nxt) { |cur, exp| cur[:gen] == exp[:gen] }   #=> true
 config.get         #=> {gen: 2, host: "b"}
 ```
 
-**[Full documentation: `Ractor::SharedVar`](docs/shared_var.md)** — the ordering
+**[Full documentation: `Ractor::LockFree::Var`](docs/var.md)** — the ordering
 guarantees, what the type is for, how to write the retry loop, and measurements
 against the locking equivalent.
 
@@ -109,12 +109,12 @@ NOTHING.equal?(memo.get(:not_yet, NOTHING))   #=> true
   ever waits for a resize.
 * There is **no `delete`, no `each`, no `size`**, and no conditional write. A key
   that has been stored is stored for good. When a value has to be updated from
-  its own previous value, store a `Ractor::SharedVar` and use its
+  its own previous value, store a `Ractor::LockFree::Var` and use its
   `compare_and_swap`: a lock-free table of keys to lock-free cells.
 
 ```ruby
 hits = Ractor::LockFree::Hash.new
-hits.put(:home, Ractor::SharedVar.new(Integer, 0))
+hits.put(:home, Ractor::LockFree::Var.new(Integer, 0))
 
 cell = hits.get(:home)
 4.times.map do
@@ -141,7 +141,7 @@ by a Ractor that was descheduled mid-operation, and nothing can be stranded: a
 exactly as it was and the next caller unaffected. There is no lock order, so
 there is no deadlock.
 
-`SharedVar` goes further than lock-free and is **wait-free** — nothing in it
+`LockFree::Var` goes further than lock-free and is **wait-free** — nothing in it
 loops, so every operation is one bounded atomic (`ldapr` / `stlr` / `casal` on
 arm64, a plain `mov` for a store on x86). `LockFree::Hash` is lock-free but not
 wait-free: a `put` can be made to retry by another `put`, and a caller may be
@@ -151,7 +151,7 @@ be blocked, but a single call has no fixed bound.
 What you give up in both is atomicity across more than one thing at a time — one
 variable, one key — and the handling of a lost race, which is yours rather than
 the library's. See the comparison tables for
-[`SharedVar`](docs/shared_var.md#compared-with-its-locking-neighbours) and
+[`LockFree::Var`](docs/var.md#compared-with-its-locking-neighbours) and
 [`LockFree::Hash`](docs/hash.md#compared-with-its-neighbours).
 
 ## Installation
@@ -167,7 +167,7 @@ Requires Ruby 4.0 or newer, and builds a small C extension.
 ```
 bundle install
 bundle exec rake              # compile, then run every test and doc example
-ruby benchmark/shared_var/scaling.rb
+ruby benchmark/lockfree_var/scaling.rb
 ruby benchmark/lockfree_hash/scaling.rb
 ```
 

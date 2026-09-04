@@ -4,3 +4,4 @@
 *.so
 *.o
 Gemfile.lock
+/test.rb

@@ -2,7 +2,7 @@
 #include "ruby/atomic.h"
 #include "ruby/ractor.h"
 
-/* Ractor::SharedVar - one typed, shareable value, replaced without a lock.
+/* Ractor::LockFree::Var - one typed, shareable value, replaced without a lock.
  *
  * The whole variable is a single VALUE-sized slot, and every operation on it is
  * one atomic on that slot: a load for #get, a store for #set, an exchange for
@@ -29,7 +29,7 @@
  * check and the store it guards.
  */
 
-static VALUE rb_cRactorSharedVar;
+static VALUE rb_cRactorLockFreeVar;
 
 /* Ordering.
  *
@@ -48,13 +48,13 @@ static VALUE rb_cRactorSharedVar;
  * That pairing is the whole safety argument for passing an object between
  * Ractors through this slot, and it is weaker than sequential consistency on
  * purpose.  What SEQ_CST would add is a single global order over operations on
- * *different* SharedVars -- something this library has never promised, that no
+ * *different* variables -- something this library has never promised, that no
  * documented behaviour rests on, and that costs a full barrier on every write.
  *
  * What is kept is everything that is promised.  Per-variable ordering does not
  * come from SEQ_CST at all: every atomic object has one modification order that
  * all threads agree on whatever ordering its operations use, so two writes to
- * one SharedVar can never be seen in opposite orders by two Ractors.  And a
+ * one variable can never be seen in opposite orders by two Ractors.  And a
  * read-modify-write always acts on the latest value in that order, which is
  * what makes #swap and #compare_and_swap decisive rather than advisory.
  *
@@ -65,20 +65,20 @@ static VALUE rb_cRactorSharedVar;
  * SEQ_CST macros, which are strictly stronger and so still correct -- only
  * slower, and only on hardware that charges for the difference. */
 #if defined(RBIMPL_ATOMIC_ACQUIRE) && defined(RBIMPL_ATOMIC_RELEASE) && defined(RBIMPL_ATOMIC_ACQ_REL)
-# define SV_LOAD_ACQUIRE(var)          rbimpl_atomic_value_load(&(var), RBIMPL_ATOMIC_ACQUIRE)
-# define SV_STORE_RELEASE(var, val)    rbimpl_atomic_value_store(&(var), (val), RBIMPL_ATOMIC_RELEASE)
-# define SV_EXCHANGE_ACQ_REL(var, val) rbimpl_atomic_value_exchange(&(var), (val), RBIMPL_ATOMIC_ACQ_REL)
-# define SV_CAS_ACQ_REL(var, old, new) \
+# define LFV_LOAD_ACQUIRE(var)          rbimpl_atomic_value_load(&(var), RBIMPL_ATOMIC_ACQUIRE)
+# define LFV_STORE_RELEASE(var, val)    rbimpl_atomic_value_store(&(var), (val), RBIMPL_ATOMIC_RELEASE)
+# define LFV_EXCHANGE_ACQ_REL(var, val) rbimpl_atomic_value_exchange(&(var), (val), RBIMPL_ATOMIC_ACQ_REL)
+# define LFV_CAS_ACQ_REL(var, old, new) \
     rbimpl_atomic_value_cas(&(var), (old), (new), RBIMPL_ATOMIC_ACQ_REL, RBIMPL_ATOMIC_ACQUIRE)
 #else
-# define SV_LOAD_ACQUIRE(var)          ((VALUE)RUBY_ATOMIC_PTR_LOAD(var))
-# define SV_STORE_RELEASE(var, val)    RUBY_ATOMIC_VALUE_SET((var), (val))
-# define SV_EXCHANGE_ACQ_REL(var, val) RUBY_ATOMIC_VALUE_EXCHANGE((var), (val))
-# define SV_CAS_ACQ_REL(var, old, new) RUBY_ATOMIC_VALUE_CAS((var), (old), (new))
+# define LFV_LOAD_ACQUIRE(var)          ((VALUE)RUBY_ATOMIC_PTR_LOAD(var))
+# define LFV_STORE_RELEASE(var, val)    RUBY_ATOMIC_VALUE_SET((var), (val))
+# define LFV_EXCHANGE_ACQ_REL(var, val) RUBY_ATOMIC_VALUE_EXCHANGE((var), (val))
+# define LFV_CAS_ACQ_REL(var, old, new) RUBY_ATOMIC_VALUE_CAS((var), (old), (new))
 #endif
 
-struct shared_var {
-    VALUE value;   /* only ever touched through the SV_* atomics above */
+struct lfv_var {
+    VALUE value;   /* only ever touched through the LFV_* atomics above */
     VALUE type;    /* a Module; set once by #initialize and never written again.
                     * Read plainly: it is written before the variable is frozen
                     * and made shareable, and whatever handed the variable to
@@ -86,44 +86,44 @@ struct shared_var {
 };
 
 static void
-shared_var_mark(void *ptr)
+lfv_mark(void *ptr)
 {
-    struct shared_var *sv = ptr;
+    struct lfv_var *v = ptr;
 
     /* GC marking runs with every Ractor stopped, so a plain read would do; the
      * acquire load costs nothing here and keeps the rule -- this slot is only
      * ever read with an acquire -- true of every line that touches it. */
-    rb_gc_mark(SV_LOAD_ACQUIRE(sv->value));
-    rb_gc_mark(sv->type);
+    rb_gc_mark(LFV_LOAD_ACQUIRE(v->value));
+    rb_gc_mark(v->type);
 }
 
 static size_t
-shared_var_memsize(const void *ptr)
+lfv_memsize(const void *ptr)
 {
-    return sizeof(struct shared_var);
+    return sizeof(struct lfv_var);
 }
 
 /* Deliberately not RUBY_TYPED_WB_PROTECTED. Doesn't matter on Ruby 4.1.0 (rlgc) because it's
  * marked shareable anyway.
  */
-static const rb_data_type_t shared_var_data_type = {
-    "Ractor::SharedVar",
-    {shared_var_mark, RUBY_TYPED_DEFAULT_FREE, shared_var_memsize, NULL},
+static const rb_data_type_t lfv_data_type = {
+    "Ractor::LockFree::Var",
+    {lfv_mark, RUBY_TYPED_DEFAULT_FREE, lfv_memsize, NULL},
     0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE
 };
 
-static struct shared_var *
-shared_var_ptr(VALUE self)
+static struct lfv_var *
+lfv_ptr(VALUE self)
 {
-    struct shared_var *sv;
+    struct lfv_var *v;
 
-    TypedData_Get_Struct(self, struct shared_var, &shared_var_data_type, sv);
+    TypedData_Get_Struct(self, struct lfv_var, &lfv_data_type, v);
     /* .allocate without .new leaves no type, and every write is checked against
      * the type. */
-    if (RB_UNLIKELY(NIL_P(sv->type))) {
+    if (RB_UNLIKELY(NIL_P(v->type))) {
         rb_raise(rb_eTypeError, "uninitialized %"PRIsVALUE, rb_obj_class(self));
     }
-    return sv;
+    return v;
 }
 
 /* Everything a value must satisfy to go into the slot.  Raises, and raising
@@ -131,7 +131,7 @@ shared_var_ptr(VALUE self)
  * Takes the type rather than reading it off the variable so that #initialize can
  * check a value against a type it has not committed to yet. */
 static void
-shared_var_check(VALUE type, VALUE val)
+lfv_check(VALUE type, VALUE val)
 {
     if (RB_UNLIKELY(!RTEST(rb_obj_is_kind_of(val, type)))) {
         rb_raise(rb_eTypeError, "expected a %"PRIsVALUE", got %"PRIsVALUE,
@@ -144,31 +144,31 @@ shared_var_check(VALUE type, VALUE val)
 }
 
 static VALUE
-shared_var_alloc(VALUE klass)
+lfv_alloc(VALUE klass)
 {
-    struct shared_var *sv;
-    VALUE obj = TypedData_Make_Struct(klass, struct shared_var, &shared_var_data_type, sv);
+    struct lfv_var *v;
+    VALUE obj = TypedData_Make_Struct(klass, struct lfv_var, &lfv_data_type, v);
 
-    sv->value = Qnil;
-    sv->type = Qnil;
+    v->value = Qnil;
+    v->type = Qnil;
     return obj;
 }
 
 /*
  *  call-seq:
- *     Ractor::SharedVar.new(type, value) -> shared_var
+ *     Ractor::LockFree::Var.new(type, value) -> var
  *
  *  Makes a variable holding +value+, which every later write must be a +type+.
  */
 static VALUE
-shared_var_initialize(VALUE self, VALUE type, VALUE value)
+lfv_initialize(VALUE self, VALUE type, VALUE value)
 {
-    struct shared_var *sv;
+    struct lfv_var *v;
 
     /* Without this, send(:initialize) on a variable already in use would
      * retype it under whoever was reading it. */
     rb_check_frozen(self);
-    TypedData_Get_Struct(self, struct shared_var, &shared_var_data_type, sv);
+    TypedData_Get_Struct(self, struct lfv_var, &lfv_data_type, v);
 
     if (RB_UNLIKELY(!RTEST(rb_obj_is_kind_of(type, rb_cModule)))) {
         rb_raise(rb_eTypeError, "type must be a Class or Module, got %"PRIsVALUE,
@@ -177,11 +177,11 @@ shared_var_initialize(VALUE self, VALUE type, VALUE value)
     /* The type goes in only once the value has passed against it: a rejected
      * #initialize leaves an untyped variable, which every method refuses, rather
      * than a typed one holding nil. */
-    shared_var_check(type, value);
-    sv->type = type;
+    lfv_check(type, value);
+    v->type = type;
     /* Nothing can reach this variable yet, so ordering is not in question; the
      * release keeps every store to the slot the same shape as every other. */
-    SV_STORE_RELEASE(sv->value, value);
+    LFV_STORE_RELEASE(v->value, value);
 
     /* Nothing in the object itself changes after this, so it can be frozen and
      * handed to any Ractor; RUBY_TYPED_FROZEN_SHAREABLE is what allows it for a
@@ -193,55 +193,55 @@ shared_var_initialize(VALUE self, VALUE type, VALUE value)
 
 /*
  *  call-seq:
- *     shared_var.get -> value
+ *     var.get -> value
  *
  *  The value written by the most recently completed write, from any Ractor.
  *  Never blocks and never raises.
  */
 static VALUE
-shared_var_get(VALUE self)
+lfv_get(VALUE self)
 {
-    return SV_LOAD_ACQUIRE(shared_var_ptr(self)->value);
+    return LFV_LOAD_ACQUIRE(lfv_ptr(self)->value);
 }
 
 /*
  *  call-seq:
- *     shared_var.set(value) -> value
+ *     var.set(value) -> value
  *
  *  Makes +value+ what every later #get returns, and returns it.  Never blocks.
  *  Raises TypeError unless +value+ is of the variable's type, and ArgumentError
  *  unless it is shareable; either way the variable is left as it was.
  */
 static VALUE
-shared_var_set(VALUE self, VALUE value)
+lfv_set(VALUE self, VALUE value)
 {
-    struct shared_var *sv = shared_var_ptr(self);
+    struct lfv_var *v = lfv_ptr(self);
 
-    shared_var_check(sv->type, value);
-    SV_STORE_RELEASE(sv->value, value);
+    lfv_check(v->type, value);
+    LFV_STORE_RELEASE(v->value, value);
     return value;
 }
 
 /*
  *  call-seq:
- *     shared_var.swap(value) -> previous value
+ *     var.swap(value) -> previous value
  *
  *  Sets +value+ and returns what was there, in one step, so the value it returns
  *  is one no other caller can also be handed.
  */
 static VALUE
-shared_var_swap(VALUE self, VALUE value)
+lfv_swap(VALUE self, VALUE value)
 {
-    struct shared_var *sv = shared_var_ptr(self);
+    struct lfv_var *v = lfv_ptr(self);
 
-    shared_var_check(sv->type, value);
-    return SV_EXCHANGE_ACQ_REL(sv->value, value);
+    lfv_check(v->type, value);
+    return LFV_EXCHANGE_ACQ_REL(v->value, value);
 }
 
 /*
  *  call-seq:
- *     shared_var.compare_and_swap(expected, value) -> true or false
- *     shared_var.compare_and_swap(expected, value) {|current, expected| bool } -> true or false
+ *     var.compare_and_swap(expected, value) -> true or false
+ *     var.compare_and_swap(expected, value) {|current, expected| bool } -> true or false
  *
  *  Sets +value+ only if the variable still matches +expected+, and says whether
  *  it did.
@@ -262,15 +262,15 @@ shared_var_swap(VALUE self, VALUE value)
  *  untouched.
  */
 static VALUE
-shared_var_compare_and_swap(VALUE self, VALUE expected, VALUE value)
+lfv_compare_and_swap(VALUE self, VALUE expected, VALUE value)
 {
-    struct shared_var *sv = shared_var_ptr(self);
+    struct lfv_var *v = lfv_ptr(self);
     VALUE current;
 
-    shared_var_check(sv->type, value);
+    lfv_check(v->type, value);
 
     if (!rb_block_given_p()) {
-        return SV_CAS_ACQ_REL(sv->value, expected, value) == expected ? Qtrue : Qfalse;
+        return LFV_CAS_ACQ_REL(v->value, expected, value) == expected ? Qtrue : Qfalse;
     }
 
     /* The block runs between the load and the store, so it can allocate, raise,
@@ -278,51 +278,54 @@ shared_var_compare_and_swap(VALUE self, VALUE expected, VALUE value)
      * corrupt anything: the store below is a compare-and-swap against `current`,
      * which fails if the slot moved on, and `current` is live on the machine
      * stack for as long as it is needed. */
-    current = SV_LOAD_ACQUIRE(sv->value);
+    current = LFV_LOAD_ACQUIRE(v->value);
     if (!RTEST(rb_yield_values(2, current, expected))) {
         return Qfalse;
     }
-    return SV_CAS_ACQ_REL(sv->value, current, value) == current ? Qtrue : Qfalse;
+    return LFV_CAS_ACQ_REL(v->value, current, value) == current ? Qtrue : Qfalse;
 }
 
 /*
  *  call-seq:
- *     shared_var.type -> Module
+ *     var.type -> Module
  *
  *  The type every value in this variable is.
  */
 static VALUE
-shared_var_type(VALUE self)
+lfv_type(VALUE self)
 {
-    return shared_var_ptr(self)->type;
+    return lfv_ptr(self)->type;
 }
 
 static VALUE
-shared_var_inspect(VALUE self)
+lfv_inspect(VALUE self)
 {
-    struct shared_var *sv;
+    struct lfv_var *v;
 
-    TypedData_Get_Struct(self, struct shared_var, &shared_var_data_type, sv);
-    if (NIL_P(sv->type)) {
+    TypedData_Get_Struct(self, struct lfv_var, &lfv_data_type, v);
+    if (NIL_P(v->type)) {
         return rb_sprintf("#<%"PRIsVALUE" (uninitialized)>", rb_obj_class(self));
     }
     return rb_sprintf("#<%"PRIsVALUE" %"PRIsVALUE" %+"PRIsVALUE">",
-                      rb_obj_class(self), sv->type,
-                      SV_LOAD_ACQUIRE(sv->value));
+                      rb_obj_class(self), v->type,
+                      LFV_LOAD_ACQUIRE(v->value));
 }
 
 void
-Init_shared_var(void)
+Init_lockfree_var(void)
 {
+    VALUE mLockFree;
+
     rb_ext_ractor_safe(true);   /* every method here is safe from any Ractor */
 
-    rb_cRactorSharedVar = rb_define_class_under(rb_cRactor, "SharedVar", rb_cObject);
-    rb_define_alloc_func(rb_cRactorSharedVar, shared_var_alloc);
-    rb_define_method(rb_cRactorSharedVar, "initialize", shared_var_initialize, 2);
-    rb_define_method(rb_cRactorSharedVar, "get", shared_var_get, 0);
-    rb_define_method(rb_cRactorSharedVar, "set", shared_var_set, 1);
-    rb_define_method(rb_cRactorSharedVar, "swap", shared_var_swap, 1);
-    rb_define_method(rb_cRactorSharedVar, "compare_and_swap", shared_var_compare_and_swap, 2);
-    rb_define_method(rb_cRactorSharedVar, "type", shared_var_type, 0);
-    rb_define_method(rb_cRactorSharedVar, "inspect", shared_var_inspect, 0);
+    mLockFree = rb_define_module_under(rb_cRactor, "LockFree");
+    rb_cRactorLockFreeVar = rb_define_class_under(mLockFree, "Var", rb_cObject);
+    rb_define_alloc_func(rb_cRactorLockFreeVar, lfv_alloc);
+    rb_define_method(rb_cRactorLockFreeVar, "initialize", lfv_initialize, 2);
+    rb_define_method(rb_cRactorLockFreeVar, "get", lfv_get, 0);
+    rb_define_method(rb_cRactorLockFreeVar, "set", lfv_set, 1);
+    rb_define_method(rb_cRactorLockFreeVar, "swap", lfv_swap, 1);
+    rb_define_method(rb_cRactorLockFreeVar, "compare_and_swap", lfv_compare_and_swap, 2);
+    rb_define_method(rb_cRactorLockFreeVar, "type", lfv_type, 0);
+    rb_define_method(rb_cRactorLockFreeVar, "inspect", lfv_inspect, 0);
 }

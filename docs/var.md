@@ -1,4 +1,4 @@
-# Ractor::SharedVar
+# Ractor::LockFree::Var
 
 **One** typed variable that Ractors share, read and replace **without a lock**.
 Every operation on it is a single atomic instruction on a single machine word:
@@ -6,9 +6,9 @@ nothing waits, nothing can be held, and there is nothing for a killed Ractor to
 strand.
 
 ```ruby
-require "ractor/shared_var"
+require "ractor/lockfree/var"
 
-var = Ractor::SharedVar.new(String, "hi".freeze)
+var = Ractor::LockFree::Var.new(String, "hi".freeze)
 var.set("omg".freeze)
 
 r = Ractor.new(var) do |v|
@@ -23,7 +23,7 @@ var.get            #=> "wonderful"
 ## API
 
 ```ruby
-var = Ractor::SharedVar.new(type, value)
+var = Ractor::LockFree::Var.new(type, value)
 
 var.get                            # the latest completed write, from any Ractor
 var.set(value)                     # make it the latest; returns value
@@ -44,7 +44,7 @@ block `compare_and_swap` takes.
 
 ## What is guaranteed
 
-Every write to a `SharedVar` is a **release** and every read is an **acquire**.
+Every write to a `LockFree::Var` is a **release** and every read is an **acquire**.
 Concretely:
 
 * **`get` returns the most recently completed write**, whichever Ractor made it.
@@ -64,11 +64,11 @@ Concretely:
   in that Ractor can return anything earlier in the order.
 
 What is *not* guaranteed is any relationship between two different variables.
-Ordering holds per variable; two `SharedVar`s are two independent words.
+Ordering holds per variable; two `LockFree::Var`s are two independent words.
 
 ```ruby
-a = Ractor::SharedVar.new(Integer, 0)
-b = Ractor::SharedVar.new(Integer, 0)
+a = Ractor::LockFree::Var.new(Integer, 0)
+b = Ractor::LockFree::Var.new(Integer, 0)
 a.set(1); b.set(1)     # another Ractor may see b == 1 while a == 0
 ```
 
@@ -106,7 +106,7 @@ The type is fixed when the variable is made and checked on **every** write,
 including writes from other Ractors:
 
 ```ruby
-counter = Ractor::SharedVar.new(Integer, 0)
+counter = Ractor::LockFree::Var.new(Integer, 0)
 counter.set(1)
 counter.type       #=> Integer
 ```
@@ -122,11 +122,11 @@ the check is `kind_of?`, so a subclass is fine.
 
 ## The value must be shareable
 
-A `SharedVar` holds one **shareable** object, and so does everything written into
+A `LockFree::Var` holds one **shareable** object, and so does everything written into
 it. Anything else raises `ArgumentError`:
 
 ```ruby
-box = Ractor::SharedVar.new(Hash, {}.freeze)
+box = Ractor::LockFree::Var.new(Hash, {}.freeze)
 box.set({ a: 1 }.freeze)
 box.get            #=> {a: 1}
 ```
@@ -143,7 +143,7 @@ A string literal is **not** frozen unless the file says so, so this is the first
 thing most code trips over:
 
 ```ruby
-label = Ractor::SharedVar.new(String, "hi".freeze)
+label = Ractor::LockFree::Var.new(String, "hi".freeze)
 label.set("bye".freeze)
 label.get          #=> "bye"
 ```
@@ -167,7 +167,7 @@ counter.set(n + 1)
 holds what you read**, and tells you whether it did:
 
 ```ruby
-state = Ractor::SharedVar.new(Symbol, :idle)
+state = Ractor::LockFree::Var.new(Symbol, :idle)
 state.compare_and_swap(:idle, :running)   #=> true    # we claimed it
 state.compare_and_swap(:idle, :running)   #=> false   # somebody else already had
 ```
@@ -196,7 +196,7 @@ is a good reason to keep that stretch short.
 Four Ractors incrementing 500 times each:
 
 ```ruby
-tally = Ractor::SharedVar.new(Integer, 0)
+tally = Ractor::LockFree::Var.new(Integer, 0)
 4.times.map do
   Ractor.new(tally) do |v|
     500.times { loop { old = v.get; break if v.compare_and_swap(old, old + 1) } }
@@ -214,7 +214,7 @@ and frozen containers it is not:
 ```ruby
 one = "same".dup.freeze
 two = "same".dup.freeze
-tag = Ractor::SharedVar.new(String, one)
+tag = Ractor::LockFree::Var.new(String, one)
 tag.compare_and_swap(two, "x".freeze)   #=> false
 tag.compare_and_swap(one, "x".freeze)   #=> true
 ```
@@ -228,7 +228,7 @@ is there and then the one you expected**, and a true return lets the write go
 ahead:
 
 ```ruby
-tag2 = Ractor::SharedVar.new(String, "same".dup.freeze)
+tag2 = Ractor::LockFree::Var.new(String, "same".dup.freeze)
 tag2.compare_and_swap("same".dup.freeze, "x".freeze) { |current, expected| current == expected }
 tag2.get           #=> "x"
 ```
@@ -287,7 +287,7 @@ a variable exactly once, with no loop at all.
 
 ## Compared with its locking neighbours
 
-| | `Ractor::SharedVar` | `Ractor::LockVar` | `Ractor::TVar` |
+| | `Ractor::LockFree::Var` | `Ractor::LockVar` | `Ractor::TVar` |
 |---|---|---|---|
 | synchronizes | one variable | one variable | several together |
 | mechanism | atomic word | a lock | optimistic transaction |
@@ -311,14 +311,14 @@ the lock.
 The workload is one shared value, a frozen `{status:, seq:}` record. Numbers are
 **nanoseconds per completed operation across all Ractors**, so one that halves
 when the Ractors double means it scaled. Measured on an arm64 laptop, 8
-performance cores, ruby 4.0.6; `benchmark/shared_var/scaling.rb` runs it and
+performance cores, ruby 4.0.6; `benchmark/lockfree_var/scaling.rb` runs it and
 checks afterwards that no write was lost. Each cell is the median of three runs.
 The `cas loop` column is the Ruby-level retry loop from *Read-modify-write*, so it
 includes the cost of re-running the loop body on every lost race.
 
 ### All Ractors on one variable
 
-| Ractors | `SharedVar#get` | `LockVar#value` | `SharedVar` cas loop | `LockVar#update` |
+| Ractors | `LockFree::Var#get` | `LockVar#value` | `LockFree::Var` cas loop | `LockVar#update` |
 |---:|---:|---:|---:|---:|
 | 1 | 23 | 35 | 215 | 225 |
 | 2 | 12 | 88 | 269 | 659 |
@@ -331,7 +331,7 @@ because the reads run in parallel and an uncontended cache line is shared, not
 passed around. The locking version goes the other way — 35 ns to 423, because
 those eight readers form a queue — so at eight Ractors the gap is over 100×. The
 `LockVar` cells here are the volatile ones, moving 10–30% between sweeps; the
-`SharedVar` cells moved by under 10%.
+`LockFree::Var` cells moved by under 10%.
 
 **Contended writing does not scale, and nothing makes it.** One word can only be
 written one at a time by anybody, so the retry loop climbs from 215 ns to 648: the

@@ -169,12 +169,12 @@ n = counter.get(:hits)
 counter.put(:hits, n + 1)
 ```
 
-`Ractor::SharedVar` is what closes that gap, and it is shareable, so it can be
+`Ractor::LockFree::Var` is what closes that gap, and it is shareable, so it can be
 the value:
 
 ```ruby
 hits = Ractor::LockFree::Hash.new
-hits.put(:home, Ractor::SharedVar.new(Integer, 0))
+hits.put(:home, Ractor::LockFree::Var.new(Integer, 0))
 
 cell = hits.get(:home)
 4.times.map do
@@ -241,7 +241,7 @@ slot has been carried, and freed by the GC once no Ractor is still reading it.
 * **Iterate, count, or hand you a `Hash`.** There is no `each`, `size`, `keys` or
   `to_h`. A traversal of a table that other Ractors are writing has to define
   what it means, and none of the definitions are cheap. Keep the key list on the
-  side if you need one — a frozen array in a `Ractor::SharedVar`, say.
+  side if you need one — a frozen array in a `Ractor::LockFree::Var`, say.
 * **Conditional or atomic read-modify-write.** No `compare_and_swap`, no
   `update`, no `fetch_or_store`. See *Read-modify-write*.
 * **Order two different keys.** See *What is guaranteed*.
@@ -321,7 +321,7 @@ written one at a time by anybody, so the hot-key column turns around after two
 Ractors and settles around 48 ns — and it is the one volatile column, moving
 50% between sweeps, because it is a cache line being fought over. It climbs
 gently and it never blocks a caller, but if every Ractor writes the same key,
-give them a key each, or a `Ractor::SharedVar` each, and combine afterwards.
+give them a key each, or a `Ractor::LockFree::Var` each, and combine afterwards.
 
 ## Implementation notes
 
@@ -386,7 +386,7 @@ give them a key each, or a `Ractor::SharedVar` each, and combine afterwards.
   (`rb_ext_ractor_safe`), and the read path allocates nothing at all: `get`
   returns either a `VALUE` out of a slot or the default it was handed.
 * It is **lock-free, not wait-free**, and that is the difference from
-  `Ractor::SharedVar`: a `put` can be made to go round its loop again by another
+  `Ractor::LockFree::Var`: a `put` can be made to go round its loop again by another
   Ractor's `put`, and a caller can be handed migration work. Some caller always
   makes progress, and no caller can be blocked by one that stopped — but no
   individual call has a fixed instruction bound.

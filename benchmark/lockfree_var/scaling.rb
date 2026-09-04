@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
-# How Ractor::SharedVar scales: N Ractors doing the same operation, on one
+# How Ractor::LockFree::Var scales: N Ractors doing the same operation, on one
 # shared variable and then on one variable each.
 #
-#   ruby benchmark/shared_var/scaling.rb [max_ractors]
+#   ruby benchmark/lockfree_var/scaling.rb [max_ractors]
 #
 # Reported as nanoseconds per completed operation across all Ractors, so a
 # number that halves when the Ractors double means the operation scaled.
@@ -46,9 +46,9 @@ def measure(vars, op)
 end
 
 def bench(n, op, shared:)
-  one = Ractor::SharedVar.new(Hash, RECORD)
+  one = Ractor::LockFree::Var.new(Hash, RECORD)
   times = RUNS.times.map do
-    vars = shared ? Array.new(n) { one } : Array.new(n) { Ractor::SharedVar.new(Hash, RECORD) }
+    vars = shared ? Array.new(n) { one } : Array.new(n) { Ractor::LockFree::Var.new(Hash, RECORD) }
     measure(vars, op)
   end
   times.sort[RUNS / 2] * 1e9 / (n * K)
@@ -69,7 +69,7 @@ puts
 end
 
 # A retry loop must never lose a write, however many Ractors fight over it.
-counter = Ractor::SharedVar.new(Integer, 0)
+counter = Ractor::LockFree::Var.new(Integer, 0)
 n, k = [COUNTS.max, 4].max, 5_000
 n.times.map do
   Ractor.new(counter, k) do |v, m|
@@ -103,7 +103,7 @@ else
   end
 
   puts "\n## versus Ractor::LockVar, all Ractors on one variable\n\n"
-  puts "| Ractors | SharedVar#get | LockVar#value | SharedVar cas loop | LockVar#update |"
+  puts "| Ractors | LockFree::Var#get | LockVar#value | LockFree::Var cas loop | LockVar#update |"
   puts "|---:|---:|---:|---:|---:|"
   COUNTS.each do |n|
     printf("| %d | %.0f | %.0f | %.0f | %.0f |\n", n,

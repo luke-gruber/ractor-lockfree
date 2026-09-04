@@ -1,4 +1,4 @@
 # frozen_string_literal: true
 
 require "mkmf"
-create_makefile("ractor/shared_var")
+create_makefile("ractor/lockfree_var")

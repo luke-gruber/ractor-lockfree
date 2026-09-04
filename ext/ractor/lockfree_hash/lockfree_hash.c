@@ -86,7 +86,7 @@
  * are done.
  *
  * Ordering is release/acquire, for the reason documented at length in
- * shared_var.c: a writer's stores are finished before another Ractor can see
+ * lockfree_var.c: a writer's stores are finished before another Ractor can see
  * the pointer to them, per-slot ordering comes from each atomic's own
  * modification order rather than from SEQ_CST, and nothing here promises a
  * global order across different slots.
@@ -102,7 +102,7 @@ static VALUE lfh_cTable;
 /* ---------------------------------------------------------------------------
  * Atomics
  *
- * Same arrangement as shared_var.c: the memory order is a parameter on the
+ * Same arrangement as lockfree_var.c: the memory order is a parameter on the
  * rbimpl_atomic_* inline functions that ruby/atomic.h ships, and where those
  * are absent these fall back to the public SEQ_CST macros, which are stronger
  * than needed and so still correct.

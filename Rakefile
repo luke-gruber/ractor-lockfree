@@ -10,6 +10,7 @@ Rake::TestTask.new(:test) do |t|
 end
 
 Rake::ExtensionTask.new("ractor/shared_var")
+Rake::ExtensionTask.new("ractor/lockfree_hash")
 
 task test: :compile
 task default: :test

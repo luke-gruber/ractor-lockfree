@@ -1,13 +1,15 @@
 # ractor-lockfree
 
-A variable that Ractors share **without a lock**.
+State that Ractors share **without a lock**: a variable, and a hash table.
 
-`Ractor::SharedVar` holds one typed, shareable value. Any Ractor may read it or
-replace it, and no operation on it can ever block another one: each is a single
-atomic instruction on a single machine word.
+## Ractor::SharedVar
+
+One typed, shareable value. Any Ractor may read it or replace it, and no
+operation on it can ever block another one: each is a single atomic instruction
+on a single machine word.
 
 ```ruby
-require "ractor/shared_var"
+require "ractor/lockfree"
 
 var = Ractor::SharedVar.new(String, "hi".freeze)
 var.set("hello".freeze)
@@ -60,20 +62,97 @@ config.get         #=> {gen: 2, host: "b"}
 guarantees, what the type is for, how to write the retry loop, and measurements
 against the locking equivalent.
 
+## Ractor::LockFree::Hash
+
+A hash table many Ractors read and write at once. Two operations — `get` and
+`put` — and no lock anywhere: a write touches one key's word, and a read of a
+key nobody is writing does not touch anything at all.
+
+```ruby
+require "ractor/lockfree"
+
+routes = Ractor::LockFree::Hash.new
+routes.put("/health".freeze, :ok)
+
+Ractor.new(routes) { |h| h.put("/users".freeze, :index) }.join
+
+routes.get("/users".freeze)      #=> :index
+routes.get("/nope".freeze)       #=> nil
+```
+
+* Keys and values must be **shareable**, like everything else Ractors pass
+  around, and the table itself is frozen and shareable. Keys are matched the way
+  `Hash` matches them, by `#hash` and `#eql?`.
+* `get` takes a **default** for a key that is not there, which is also how a
+  stored `nil` is told from a missing key — pass a sentinel the table cannot be
+  holding. It must be shareable too, since a caller cannot tell whether what
+  came back was stored or defaulted:
+
+```ruby
+NOTHING = Object.new.freeze
+
+memo = Ractor::LockFree::Hash.new
+memo.put(:looked_up, nil)
+
+memo.get(:looked_up)                          #=> nil
+NOTHING.equal?(memo.get(:looked_up, NOTHING)) #=> false
+NOTHING.equal?(memo.get(:not_yet, NOTHING))   #=> true
+```
+
+* **Reads scale perfectly, and reading one hot key scales best of all** — eight
+  Ractors reading the same key cost 5 ns each where one Ractor costs 34, because
+  a cache line nobody writes is free to share. That is what the table is for: a
+  registry or cache that many Ractors read constantly and add to occasionally.
+* It **grows without a lock and without stopping anybody.** The table doubles at
+  three-quarters full, and the callers passing through carry the old slots into
+  the new table a batch at a time — writers 64 slots, readers 8 — so no caller
+  ever waits for a resize.
+* There is **no `delete`, no `each`, no `size`**, and no conditional write. A key
+  that has been stored is stored for good. When a value has to be updated from
+  its own previous value, store a `Ractor::SharedVar` and use its
+  `compare_and_swap`: a lock-free table of keys to lock-free cells.
+
+```ruby
+hits = Ractor::LockFree::Hash.new
+hits.put(:home, Ractor::SharedVar.new(Integer, 0))
+
+cell = hits.get(:home)
+4.times.map do
+  Ractor.new(cell) do |c|
+    250.times { loop { n = c.get; break if c.compare_and_swap(n, n + 1) } }
+  end
+end.each(&:join)
+
+hits.get(:home).get              #=> 1000
+```
+
+**[Full documentation: `Ractor::LockFree::Hash`](docs/hash.md)** — what a reader
+can and cannot see, what growing costs, how it compares with a `Hash` behind a
+lock, and the measurements.
+
 ## Why lock-free
 
-Reading one shared variable from many Ractors is cheaper than taking a lock.
+Reading shared state from many Ractors is cheaper than taking a lock — and it is
+the thing Ractors do most.
 
-Nothing waits, and nothing in the library loops: every operation is one bounded
-atomic — `ldapr` / `stlr` / `casal` on arm64, a plain `mov` for a store on x86 —
-so it is **wait-free**, not merely lock-free. Nothing can be stranded either —
-a `Thread#kill`, an exception or a `return` out of a retry loop leaves the
-variable exactly as it was and the next caller unaffected. There is no lock
-order, so there is no deadlock.
+Nothing waits. A reader cannot be held up by a writer, a writer cannot be held up
+by a Ractor that was descheduled mid-operation, and nothing can be stranded: a
+`Thread#kill`, an exception or a `return` out of a retry loop leaves the state
+exactly as it was and the next caller unaffected. There is no lock order, so
+there is no deadlock.
 
-What you give up is that a lost race is yours to handle rather than the
-library's, and that ordering holds for one variable at a time. See
-[the comparison table](docs/shared_var.md#compared-with-its-locking-neighbours).
+`SharedVar` goes further than lock-free and is **wait-free** — nothing in it
+loops, so every operation is one bounded atomic (`ldapr` / `stlr` / `casal` on
+arm64, a plain `mov` for a store on x86). `LockFree::Hash` is lock-free but not
+wait-free: a `put` can be made to retry by another `put`, and a caller may be
+handed a batch of migration work. Somebody always makes progress and nobody can
+be blocked, but a single call has no fixed bound.
+
+What you give up in both is atomicity across more than one thing at a time — one
+variable, one key — and the handling of a lost race, which is yours rather than
+the library's. See the comparison tables for
+[`SharedVar`](docs/shared_var.md#compared-with-its-locking-neighbours) and
+[`LockFree::Hash`](docs/hash.md#compared-with-its-neighbours).
 
 ## Installation
 
@@ -89,6 +168,7 @@ Requires Ruby 4.0 or newer, and builds a small C extension.
 bundle install
 bundle exec rake              # compile, then run every test and doc example
 ruby benchmark/shared_var/scaling.rb
+ruby benchmark/lockfree_hash/scaling.rb
 ```
 
 ## Prior art

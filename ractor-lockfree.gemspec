@@ -8,12 +8,12 @@ Gem::Specification.new do |spec|
   spec.authors = ["Luke Gruber (Shopify)"]
 
   spec.summary = "Lock-free shareable data structures for Ractors"
-  spec.description = "Data structures include Ractor::SharedVar"
+  spec.description = "Data structures include Ractor::SharedVar and Ractor::LockFree::Hash"
   spec.license = "MIT"
   # spec.homepage = "https://github.com/<you>/ractor-lockfree"
   # spec.metadata["source_code_uri"] = spec.homepage
   spec.required_ruby_version = ">= 4.0"
-  spec.extensions = %w[ext/ractor/shared_var/extconf.rb]
+  spec.extensions = %w[ext/ractor/shared_var/extconf.rb ext/ractor/lockfree_hash/extconf.rb]
 
   spec.files = Dir["lib/**/*.rb", "ext/**/*.{c,h,rb}", "docs/*.md", "README.md", "LICENSE.txt"]
   spec.require_paths = ["lib"]
